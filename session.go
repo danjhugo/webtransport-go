@@ -1,9 +1,11 @@
 package webtransport
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -29,6 +31,11 @@ type acceptQueue[T any] struct {
 	// There's no explicit limit to the length of the queue, but it is implicitly
 	// limited by the stream flow control provided by QUIC.
 	queue []T
+}
+
+type receiveMessageResult struct {
+	msg []byte
+	err error
 }
 
 func newAcceptQueue[T any]() *acceptQueue[T] {
@@ -270,6 +277,64 @@ func (s *Session) AcceptUniStream(ctx context.Context) (ReceiveStream, error) {
 		case <-s.uniAcceptQueue.Chan():
 		}
 	}
+}
+
+func (s *Session) ReceiveHttpDatagram(ctx context.Context) ([]byte, error) {
+	s.closeMx.Lock()
+	closeErr := s.closeErr
+	s.closeMx.Unlock()
+	if closeErr != nil {
+		return nil, closeErr
+	}
+
+	resultChannel := make(chan receiveMessageResult)
+	go func() {
+		msg, err := s.qconn.ReceiveDatagram(ctx)
+		resultChannel <- receiveMessageResult{msg: msg, err: err}
+	}()
+
+	for {
+		select {
+		case result := <-resultChannel:
+			if result.err != nil {
+				return nil, result.err
+			}
+
+			// RFC9297 2.1 says:
+			//   "If an HTTP/3 Datagram is received and its Quarter Stream ID field
+			//   maps to a stream that has not yet been created, the receiver SHALL
+			//   either drop that datagram silently or buffer it temporarily (on the
+			//   order of a round trip) while awaiting the creation of the
+			//   corresponding stream."
+			quarterStreamId, err := quicvarint.Read(bytes.NewReader(result.msg))
+			if err != nil {
+				return nil, err
+			}
+			_, ok := s.streams.m[quic.StreamID(quarterStreamId*4)]
+			if !ok {
+				continue // TODO implement buffering here instead.
+			}
+			return result.msg[quicvarint.Len(quarterStreamId):], nil
+		case <-ctx.Done():
+			return nil, fmt.Errorf("WebTransport stream closed")
+		}
+	}
+}
+
+// SendDatagram sends a WebTransport datagram over a Session.
+func (s *Session) SendHttpDatagram(payload []byte) error {
+	s.closeMx.Lock()
+	closeErr := s.closeErr
+	s.closeMx.Unlock()
+	if closeErr != nil {
+		return closeErr
+	}
+
+	buf := &bytes.Buffer{}
+	quarterStreamId := uint64(s.requestStr.StreamID() / 4)
+	buf.Write(quicvarint.Append(nil, quarterStreamId))
+	buf.Write(payload)
+	return s.qconn.SendDatagram(buf.Bytes())
 }
 
 func (s *Session) OpenStream() (Stream, error) {
