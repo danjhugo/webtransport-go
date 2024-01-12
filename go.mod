@@ -8,6 +8,10 @@ require (
 	go.uber.org/mock v0.3.0
 )
 
+// TODO, REMOVE AFTER PATCH TO github.com/quic-go/quic-go
+// This replacement points to https://github.com/danjhugo/quic-go/tree/support-webtransport-datagrams
+replace github.com/quic-go/quic-go => github.com/danjhugo/quic-go v0.0.0-20240112070628-c1c348c24706
+
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/francoispqt/gojay v1.2.13 // indirect
@@ -16,7 +20,6 @@ require (
 	github.com/onsi/ginkgo/v2 v2.12.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/quic-go/qpack v0.4.0 // indirect
-	github.com/quic-go/qtls-go1-20 v0.3.4 // indirect
 	golang.org/x/crypto v0.12.0 // indirect
 	golang.org/x/exp v0.0.0-20230817173708-d852ddb80c63 // indirect
 	golang.org/x/mod v0.12.0 // indirect

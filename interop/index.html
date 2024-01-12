@@ -51,12 +51,39 @@ async function runUnidirectionalTest() {
     transport.close()
 }
 
-(async function() {
-    switch("%%TEST%%") {
-    case "unidirectional":
-        await runUnidirectionalTest()
-        break
+async function runDatagramPingPong(){
+    console.log(`runDatagramPingPong`);
+    const transport = await establishSession('https://127.0.0.1:12345/datagram_unreliable_echo');
+    const writer = await transport.datagrams.writable.getWriter()
+    const reader = transport.datagrams.readable.getReader();
+
+    var rxOk=0
+    for(i=0;i<5;i++){
+        const payload = "Datagram payload "+i
+        reader.read().then((result) => {
+            echo = new TextDecoder().decode(result.value)
+            if(echo == payload){
+                rxOk++
+                console.log("Recieved the expected echo datagram.")
+            } else {
+                console.error("Didn't get expected echo datagram.")
+            }
+        })
+        writer.write(new TextEncoder().encode(payload))
+        console.log("Sent datagram.")
     }
+    setTimeout(function() {
+        transport.close()
+        if(rxOk==5){
+            console.log("test succeeded.")
+            testSucceeded()
+        }
+    }, 50)
+}
+
+(async function() {
+    await runUnidirectionalTest()
+    await runDatagramPingPong()
 })()
 </script>
 </body>

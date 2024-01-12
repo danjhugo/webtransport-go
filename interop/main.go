@@ -64,8 +64,47 @@ func main() {
 		}
 		runUnidirectionalTest(conn)
 	})
+
+	wmux.HandleFunc("/datagram_unreliable_echo", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := s.Upgrade(w, r)
+		if err != nil {
+			log.Printf("upgrading failed: %s", err)
+			w.WriteHeader(500)
+			return
+		}
+		runDatagramUnreliableEcho(conn)
+	})
+
 	if err := s.ListenAndServe(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func runDatagramUnreliableEcho(session *webtransport.Session) {
+	log.Print("runDatagramUnreliableEcho")
+	err := session.DatagramReceiverStart()
+	if err != nil {
+		log.Printf("Error in DatagramReceiverStart: %s", err)
+		return
+	}
+	for {
+		dg, err := session.ReceiveDatagram(session.Context())
+		if err != nil {
+			if err.Error() == "" {
+				return // client side disconnected.
+			} else {
+				log.Printf("Error in ReceiveDatagram: %s", err.Error())
+				return
+			}
+		} else {
+			err = session.SendDatagram(dg, webtransport.PreferUnreliableDatagram)
+			if err != nil {
+				log.Printf("Error in SendDatagram: %s", err)
+				return
+			} else {
+				log.Print("Sent echo")
+			}
+		}
 	}
 }
 

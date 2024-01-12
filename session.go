@@ -1,13 +1,16 @@
 package webtransport
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -18,6 +21,8 @@ import (
 type sessionID uint64
 
 const closeWebtransportSessionCapsuleType http3.CapsuleType = 0x2843
+const datagramCapsuleType http3.CapsuleType = 0x00 // See RFC9297 section 5.4.
+const datagramCapsuleMaxBytes uint64 = 65535       // TODO review this.
 
 type acceptQueue[T any] struct {
 	mx sync.Mutex
@@ -30,6 +35,25 @@ type acceptQueue[T any] struct {
 	// limited by the stream flow control provided by QUIC.
 	queue []T
 }
+
+// datagramState wraps state variables relating to WebTransport datagram send/receive
+type datagramState struct {
+	rxReady              atomic.Bool
+	rxActive             atomic.Bool
+	capsuleRxDatagrams   chan []byte   // datagrams received via Capsule
+	capsuleRxStateChange chan struct{} // notify receiver of state change
+	quicRxDatagrams      chan []byte   // datagrams received via QUIC
+	quicRxStateChange    chan struct{} // notify receiver of state change
+}
+
+// DatagramReliability specifies a WebTransport datagram reliability requirement.
+type DatagramReliability uint
+
+const (
+	RequireUnreliableDatagram DatagramReliability = 0 // Use QUIC datagram only (unreliable), or raise an error.
+	PreferUnreliableDatagram  DatagramReliability = 1 // Use QUIC datagram if it was negotiated, otherwise fall back to Capsule datagram.
+	RequireReliableDatagram   DatagramReliability = 3 // Use Capsule datagram only (reliable).
+)
 
 func newAcceptQueue[T any]() *acceptQueue[T] {
 	return &acceptQueue[T]{c: make(chan struct{}, 1)}
@@ -78,6 +102,8 @@ type Session struct {
 	bidiAcceptQueue acceptQueue[Stream]
 	uniAcceptQueue  acceptQueue[ReceiveStream]
 
+	datagramState datagramState
+
 	// TODO: garbage collect streams from when they are closed
 	streams streamsMap
 }
@@ -93,6 +119,7 @@ func newSession(sessionID sessionID, qconn http3.StreamCreator, requestStr quic.
 		streamCtxs:      make(map[int]context.CancelFunc),
 		bidiAcceptQueue: *newAcceptQueue[Stream](),
 		uniAcceptQueue:  *newAcceptQueue[ReceiveStream](),
+		datagramState:   datagramState{},
 		streams:         *newStreamsMap(),
 	}
 	// precompute the headers for unidirectional streams
@@ -132,6 +159,7 @@ func (s *Session) handleConn() {
 
 // parseNextCapsule parses the next Capsule sent on the request stream.
 // It returns a ConnectionError, if the capsule received is a CLOSE_WEBTRANSPORT_SESSION Capsule.
+// Any WebTransport datagram capsules are sent to s.datagramState.capsuleRxDatagrams if required.
 func (s *Session) parseNextCapsule() error {
 	for {
 		// TODO: enforce max size
@@ -154,6 +182,31 @@ func (s *Session) parseNextCapsule() error {
 				Remote:    true,
 				ErrorCode: SessionErrorCode(appErrCode),
 				Message:   string(appErrMsg),
+			}
+		case datagramCapsuleType:
+			if s.datagramState.rxActive.Load() == false {
+				if _, err := io.ReadAll(r); err != nil {
+					return err
+				}
+				continue
+			}
+			reader := quicvarint.NewReader(r)
+			size, err := quicvarint.Read(reader)
+			if err != nil {
+				return err
+			}
+			if size > datagramCapsuleMaxBytes {
+				return fmt.Errorf("Datagram too big")
+			}
+			payload := make([]byte, size)
+			_, err = io.ReadFull(reader, payload)
+			if err != nil {
+				return err
+			}
+			select {
+			case s.datagramState.capsuleRxDatagrams <- payload:
+			case <-s.ctx.Done():
+				return s.closeErr
 			}
 		default:
 			// unknown capsule, skip it
@@ -268,6 +321,173 @@ func (s *Session) AcceptUniStream(ctx context.Context) (ReceiveStream, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-s.uniAcceptQueue.Chan():
+		}
+	}
+}
+
+// Call this once, at some point before ReceiveDatagram, to ensure incoming WebTransport datagrams will be handled.
+// Before this function is called, any incoming Datagrams (via QUIC datagram or Capsule protocol) will be ignored.
+// If the application will later (either temporarily or permanently) not be calling ReceiveDatagram, call DatagramReceiverPause.
+func (s *Session) DatagramReceiverStart() error {
+	s.closeMx.Lock()
+	closeErr := s.closeErr
+	s.closeMx.Unlock()
+	if closeErr != nil {
+		return s.closeErr
+	}
+	if s.datagramState.rxReady.CompareAndSwap(false, true) {
+		// First call to DatagramReceiverStart: set up channels, QUIC receiver goroutine and set rxActive flag.
+		s.datagramState.capsuleRxDatagrams = make(chan []byte)
+		s.datagramState.quicRxDatagrams = make(chan []byte)
+		if s.ConnectionState().SupportsDatagrams {
+			go func() {
+				for {
+					if s.closeErr != nil {
+						break
+					}
+					if !s.datagramState.rxActive.Load() {
+						// DatagramReceiverPause was called. Pause this goroutine until another call to DatagramReceiverStart.
+						select {
+						case <-s.datagramState.quicRxStateChange:
+							continue
+						}
+					}
+					// Acquire a QUIC datagram. This will block until it returns, queue is closed, or ctx is Done.
+					// NOTE: ReceiveDatagram's implementation discards *newest* datagrams if its queue is full,
+					// so it's possible that these datagrams will be old.
+					quicDatagram, err := s.qconn.ReceiveDatagram(s.ctx)
+					if err != nil {
+						break
+					}
+					// RFC9297 2.1 specifies the following:
+					//     "If an HTTP/3 Datagram is received and its Quarter Stream ID field
+					//     maps to a stream that has not yet been created, the receiver SHALL
+					//     either drop that datagram silently or buffer it temporarily (on the
+					//     order of a round trip) while awaiting the creation of the
+					//     corresponding stream."
+					// We implement the simplest option here (drop).
+					quarterStreamId, err := quicvarint.Read(bytes.NewReader(quicDatagram))
+					if err != nil {
+						continue
+					}
+					if quarterStreamId*4 != uint64(s.requestStr.StreamID()) {
+						// Note re testing: with this code running in a server with Chrome as client, both
+						// quarterStreamId and StreamID are always zero. That's fine, but is it expected?
+						// Is this block comparing against the right stream ID? e.g. should it look at the
+						// keys of s.streams.m instead (probably not, it appears to always be empty)?
+						// TODO: implement buffering instead?
+						continue
+					}
+					if s.datagramState.rxActive.Load() {
+						select {
+						case s.datagramState.quicRxDatagrams <- quicDatagram[quicvarint.Len(quarterStreamId):]:
+							continue
+						case <-s.datagramState.quicRxStateChange:
+							continue
+						case <-s.ctx.Done():
+							break
+						}
+					}
+				}
+				close(s.datagramState.quicRxDatagrams)
+			}()
+		}
+		s.datagramState.rxActive.Store(true)
+	} else {
+		// Not the first call to DatagramReceiverStart: set rxActive flag, and un-pause QUIC receiver goroutine (if necessary).
+		if s.datagramState.rxActive.CompareAndSwap(false, true) {
+			select {
+			case s.datagramState.quicRxStateChange <- struct{}{}:
+			default:
+			}
+		}
+	}
+
+	return nil
+}
+
+// Send a Webtransport datagram over a Session.
+// The reliability argument determines whether it will be sent via QUIC or Capsule.
+// If RequireUnreliableDatagram is specified but the connection did not negotiate QUIC datagrams, an error is returned.
+func (s *Session) SendDatagram(payload []byte, reliability DatagramReliability) error {
+	s.closeMx.Lock()
+	closeErr := s.closeErr
+	s.closeMx.Unlock()
+	if closeErr != nil {
+		return closeErr
+	}
+
+	if reliability == RequireUnreliableDatagram && !s.ConnectionState().SupportsDatagrams {
+		return errors.New("datagram not supported")
+	}
+
+	var buf []byte
+	if reliability == RequireUnreliableDatagram || reliability == PreferUnreliableDatagram {
+		// sending WebTransport datagram as a QUIC datagram for unreliable delivery.
+		quarterStreamId := uint64(s.requestStr.StreamID() / 4)
+		buf = quicvarint.Append(buf, quarterStreamId)
+		buf = append(buf, payload...)
+		return s.qconn.SendDatagram(buf)
+	} else {
+		// sending WebTransport datagram as a Capsule datagram for reliable delivery.
+		// NOTE: this block has not yet been succssfully tested against Chrome (Chrome seems to only receive QUIC datagrams).
+		len := uint64(len(payload))
+		buf = quicvarint.Append(buf, len)
+		buf = append(buf, payload...)
+		return http3.WriteCapsule(quicvarint.NewWriter(s.requestStr), datagramCapsuleType, buf)
+	}
+}
+
+// ReceiveDatagram returns a WebTransport datagram, received either via QUIC datagram (if negotiated) or Capsule protocol.
+// Returns immediately if a datagram is ready, otherwise blocks until either a WebTransport datagram arrives, DatagramReceiverPause is called, or the session terminates.
+// If DatagramReceiverStart was not called or DatagramReceiverPause has been called, error will be non-nil.
+func (s *Session) ReceiveDatagram(context.Context) ([]byte, error) {
+	s.closeMx.Lock()
+	closeErr := s.closeErr
+	s.closeMx.Unlock()
+	if closeErr != nil {
+		return nil, s.closeErr
+	}
+	for {
+		if s.datagramState.rxActive.Load() {
+			select {
+			case <-s.datagramState.capsuleRxStateChange:
+				continue
+			case <-s.datagramState.quicRxStateChange:
+				continue
+			case dg, ok := <-s.datagramState.capsuleRxDatagrams:
+				if ok {
+					return dg, nil
+				} else {
+					return nil, errors.New("Not receiving datagrams")
+				}
+			case dg, ok := <-s.datagramState.quicRxDatagrams:
+				if ok {
+					return dg, nil
+				} else {
+					return nil, errors.New("Not receiving datagrams")
+				}
+			case <-s.ctx.Done():
+				return nil, s.closeErr
+			}
+		} else {
+			return nil, errors.New("Not receiving datagrams")
+		}
+	}
+}
+
+// Pause handling of incoming WebTransport datagrams via QUIC and/or Capsule.
+// After a call to this function has returned, it is safe to call DatagramReceiverStart again later if required.
+func (s *Session) DatagramReceiverPause() {
+	if s.datagramState.rxActive.CompareAndSwap(true, false) {
+		// unblock any handlers blocked on a channel send.
+		select {
+		case s.datagramState.capsuleRxStateChange <- struct{}{}:
+		default:
+		}
+		select {
+		case s.datagramState.quicRxStateChange <- struct{}{}:
+		default:
 		}
 	}
 }
