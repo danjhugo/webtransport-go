@@ -22,7 +22,7 @@ type sessionID uint64
 
 const closeWebtransportSessionCapsuleType http3.CapsuleType = 0x2843
 const datagramCapsuleType http3.CapsuleType = 0x00 // See RFC9297 section 5.4.
-const datagramCapsuleMaxBytes uint64 = 65535       // TODO review this.
+const datagramCapsuleMaxBytes uint64 = 1200        // TODO review this.
 
 type acceptQueue[T any] struct {
 	mx sync.Mutex
@@ -327,6 +327,18 @@ func (s *Session) AcceptUniStream(ctx context.Context) (ReceiveStream, error) {
 		case <-s.uniAcceptQueue.Chan():
 		}
 	}
+}
+
+// Return the maximum number of bytes allowed in a WebTransport datagram payload.
+func (s *Session) DatagramMaxSize() (uint32, error) {
+	s.closeMx.Lock()
+	closeErr := s.closeErr
+	s.closeMx.Unlock()
+	if closeErr != nil {
+		return 0, s.closeErr
+	}
+	return uint32(datagramCapsuleMaxBytes), nil
+	// TODO use path MTU discovery
 }
 
 // Call this once, at some point before ReceiveDatagram, to ensure incoming WebTransport datagrams will be handled.
