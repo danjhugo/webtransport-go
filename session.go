@@ -434,7 +434,8 @@ func (s *Session) SendDatagram(payload []byte, reliability DatagramReliability) 
 		return s.qconn.SendDatagram(buf)
 	} else {
 		// sending WebTransport datagram as a Capsule datagram for reliable delivery.
-		// NOTE: this block has not yet been succssfully tested against Chrome (Chrome seems to only receive QUIC datagrams).
+		// NOTE: this path is covered by TestDatagramReliable. However, it has not yet been tested
+		// successfully against Chrome in interop (Chrome seems to only receive QUIC datagrams).
 		len := uint64(len(payload))
 		buf = quicvarint.Append(buf, len)
 		buf = append(buf, payload...)
