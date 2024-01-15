@@ -328,11 +328,11 @@ func TestUnidirectionalStreams(t *testing.T) {
 }
 
 func TestDatagramReliable(t *testing.T) {
-	datagramEcho(t, webtransport.RequireReliableDatagram)
+	datagramEcho(t, webtransport.ReliableRequired)
 }
 
 func TestDatagramUnreliable(t *testing.T) {
-	datagramEcho(t, webtransport.RequireUnreliableDatagram)
+	datagramEcho(t, webtransport.UnreliableRequired)
 }
 
 func datagramEcho(t *testing.T, reliability webtransport.DatagramReliability) {

@@ -97,7 +97,7 @@ func runDatagramUnreliableEcho(session *webtransport.Session) {
 				return
 			}
 		} else {
-			err = session.SendDatagram(dg, webtransport.PreferUnreliableDatagram)
+			err = session.SendDatagram(dg, webtransport.UnreliablePreferred)
 			if err != nil {
 				log.Printf("Error in SendDatagram: %s", err)
 				return

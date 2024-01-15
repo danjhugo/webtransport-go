@@ -50,9 +50,9 @@ type datagramState struct {
 type DatagramReliability uint
 
 const (
-	RequireUnreliableDatagram DatagramReliability = 0 // Use QUIC datagram only (unreliable), or raise an error.
-	PreferUnreliableDatagram  DatagramReliability = 1 // Use QUIC datagram if it was negotiated, otherwise fall back to Capsule datagram.
-	RequireReliableDatagram   DatagramReliability = 3 // Use Capsule datagram only (reliable).
+	UnreliableRequired  DatagramReliability = 0 // Use QUIC datagram only (unreliable), or raise an error.
+	UnreliablePreferred DatagramReliability = 1 // Use QUIC datagram if it was negotiated, otherwise fall back to Capsule datagram.
+	ReliableRequired    DatagramReliability = 3 // Use Capsule datagram only (reliable).
 )
 
 func newAcceptQueue[T any]() *acceptQueue[T] {
@@ -412,7 +412,7 @@ func (s *Session) DatagramReceiverStart() error {
 
 // Send a Webtransport datagram over a Session.
 // The reliability argument determines whether it will be sent via QUIC or Capsule.
-// If RequireUnreliableDatagram is specified but the connection did not negotiate QUIC datagrams, an error is returned.
+// If UnreliableRequired is specified but the connection did not negotiate QUIC datagrams, an error is returned.
 func (s *Session) SendDatagram(payload []byte, reliability DatagramReliability) error {
 	s.closeMx.Lock()
 	closeErr := s.closeErr
@@ -421,12 +421,12 @@ func (s *Session) SendDatagram(payload []byte, reliability DatagramReliability) 
 		return closeErr
 	}
 
-	if reliability == RequireUnreliableDatagram && !s.ConnectionState().SupportsDatagrams {
+	if reliability == UnreliableRequired && !s.ConnectionState().SupportsDatagrams {
 		return errors.New("datagram not supported")
 	}
 
 	var buf []byte
-	if reliability == RequireUnreliableDatagram || reliability == PreferUnreliableDatagram {
+	if reliability == UnreliableRequired || reliability == UnreliablePreferred {
 		// sending WebTransport datagram as a QUIC datagram for unreliable delivery.
 		quarterStreamId := uint64(s.requestStr.StreamID() / 4)
 		buf = quicvarint.Append(buf, quarterStreamId)
