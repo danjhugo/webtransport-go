@@ -190,8 +190,12 @@ func (s *Session) parseNextCapsule() error {
 				}
 				continue
 			}
-			reader := quicvarint.NewReader(r)
-			size, err := quicvarint.Read(reader)
+
+			// TODO this works, but it would be better to read size and payload in one pass rather than buffering.
+			lr := &io.LimitedReader{R: r, N: int64(datagramCapsuleMaxBytes + 8)}
+			buf := bytes.NewBuffer(make([]byte, 0, datagramCapsuleMaxBytes+8))
+			buf.ReadFrom(lr)
+			size, err := quicvarint.Read(buf)
 			if err != nil {
 				return err
 			}
@@ -199,7 +203,7 @@ func (s *Session) parseNextCapsule() error {
 				return fmt.Errorf("Datagram too big")
 			}
 			payload := make([]byte, size)
-			_, err = io.ReadFull(reader, payload)
+			_, err = io.ReadFull(buf, payload)
 			if err != nil {
 				return err
 			}

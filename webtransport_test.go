@@ -1,6 +1,7 @@
 package webtransport_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -323,6 +325,134 @@ func TestUnidirectionalStreams(t *testing.T) {
 	rdata, err := io.ReadAll(rstr)
 	require.NoError(t, err)
 	require.Equal(t, data, rdata)
+}
+
+func TestDatagramReliable(t *testing.T) {
+	datagramEcho(t, webtransport.RequireReliableDatagram)
+}
+
+func TestDatagramUnreliable(t *testing.T) {
+	datagramEcho(t, webtransport.RequireUnreliableDatagram)
+}
+
+func datagramEcho(t *testing.T, reliability webtransport.DatagramReliability) {
+	testPayload := "1234567890abcdefghijklmnopqrstuvwxyz"
+	const maxCount = 10
+	var serverSess *webtransport.Session
+
+	clientSession, closeServer := establishSession(
+		t,
+		func(serverSession *webtransport.Session) {
+			serverSess = serverSession
+			// datagram echo server. Return incoming datagrams unchanged.
+			err := serverSession.DatagramReceiverStart()
+			if err != nil {
+				t.Logf("SERVER: Error in DatagramReceiverStart: " + err.Error())
+				require.NoError(t, err)
+				return
+			}
+			t.Logf("SERVER: ready")
+			for {
+				dg, err := serverSession.ReceiveDatagram(serverSession.Context())
+				if err != nil {
+					if err.Error() == "" {
+						t.Logf("SERVER: Client disconnected " + err.Error())
+						break
+					} else {
+						t.Logf("SERVER: Error in ReceiveDatagram: " + err.Error())
+						require.NoError(t, err)
+						break
+					}
+				} else {
+					err = serverSession.SendDatagram(dg, reliability)
+					if err != nil {
+						t.Logf("SERVER: Error in SendDatagram: " + err.Error())
+						require.NoError(t, err)
+						break
+					} else {
+						t.Logf("SERVER: Sent echo")
+					}
+				}
+			}
+			t.Logf("SERVER: finished")
+		},
+	)
+
+	// Start a goroutine to receive datagrams from the server, and check for a match
+	echoMatch := make(chan bool, maxCount)
+	clientListenerReady := make(chan bool)
+
+	var rxCount atomic.Int32
+
+	err := clientSession.DatagramReceiverStart()
+	if err != nil {
+		t.Logf("CLIENT: Error in DatagramReceiverStart: %s", err)
+		require.NoError(t, err)
+		return
+	}
+	go func() {
+		t.Logf("CLIENT: handler goroutine ready")
+		clientListenerReady <- true
+		for {
+			if clientSession.Context().Err() != nil {
+				break
+			}
+			datagram, err := clientSession.ReceiveDatagram(clientSession.Context())
+			if err != nil {
+				if err.Error() == "" {
+					t.Logf("CLIENT: server disconnected")
+				} else {
+					t.Logf("CLIENT: Error in ReceiveDatagram: " + err.Error())
+				}
+				return
+			}
+			if bytes.Equal(datagram, []byte(testPayload)) {
+				t.Logf("CLIENT: Echo matches")
+				rxCount.Add(1)
+				echoMatch <- true
+			} else {
+				t.Logf("CLIENT: Echo didn't match " + fmt.Sprint(datagram))
+				echoMatch <- false
+				break
+			}
+		}
+		t.Logf("CLIENT: receiver ended")
+	}()
+
+	// wait for the client to be ready before sending datagrams.
+	select {
+	case _ = <-clientListenerReady:
+		t.Logf("CLIENT: ready")
+	}
+
+	for i := 0; i < maxCount; i++ {
+		err := clientSession.SendDatagram([]byte(testPayload), reliability)
+		if err != nil {
+			t.Logf("CLIENT: Error in SendDatagram: " + err.Error())
+			require.NoError(t, err)
+		}
+		require.NoError(t, err)
+		t.Logf("CLIENT: Sent datagram")
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// wait for the expected number of echo datagrams, then close.
+forLoop:
+	for {
+		select {
+		case <-echoMatch:
+			if rxCount.Load() >= maxCount {
+				break forLoop
+			}
+		case _ = <-clientSession.Context().Done():
+			t.Logf("CLIENT: clientSession.Context().Done()")
+		case _ = <-serverSess.Context().Done():
+			t.Logf("CLIENT: serverSess.Context().Done()")
+		}
+	}
+	require.Equal(t, int32(maxCount), rxCount.Load())
+	closeServer()
+	clientSession.CloseWithError(0, "")
 }
 
 func TestMultipleClients(t *testing.T) {
